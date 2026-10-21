@@ -1,0 +1,8 @@
+aiohttp
+aiofiles
+beautifulsoup4
+lxml
+aiosqlite
+pyyaml
+pytest
+pytest-asyncio
