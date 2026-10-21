@@ -69,6 +69,7 @@ class MockSite:
         self.latency = latency
         self.flaky_failures = flaky_failures
         self.requests: list[tuple[float, str]] = []
+        self.agents: list[str] = []
         self.active = 0
         self.max_active = 0
         self.flaky_counter: Counter = Counter()
@@ -85,6 +86,7 @@ class MockSite:
     @web.middleware
     async def _track(self, request: web.Request, handler):
         self.requests.append((time.monotonic(), request.path))
+        self.agents.append(request.headers.get("User-Agent", ""))
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
