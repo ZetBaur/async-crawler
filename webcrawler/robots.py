@@ -53,6 +53,18 @@ def parse_crawl_delays(text: str) -> dict[str, float]:
     return delays
 
 
+def parse_sitemaps(text: str) -> list[str]:
+    """Адреса из строк 'Sitemap: ...' в robots.txt."""
+    found = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.lower().startswith("sitemap:"):
+            value = line.split(":", 1)[1].strip()
+            if value:
+                found.append(value)
+    return found
+
+
 class RobotsParser:
     """Загружает и кэширует robots.txt для каждого сайта.
 
@@ -85,6 +97,7 @@ class RobotsParser:
         robots_url = f"{origin}/robots.txt"
         rules: RobotFileParser | None = None
         delays: dict[str, float] = {}
+        sitemaps: list[str] = []
         status: int | None = None
         try:
             status, text = await self._fetcher(robots_url)
@@ -97,6 +110,7 @@ class RobotsParser:
                 rules.parse(text.splitlines())
                 rules.modified()
                 delays = parse_crawl_delays(text)
+                sitemaps = parse_sitemaps(text)
             elif status >= 500:
                 logger.warning("robots.txt ответил %s url=%s; считаю, что можно всё",
                                status, robots_url)
@@ -110,6 +124,7 @@ class RobotsParser:
             "status": status,
             "found": rules is not None,
             "crawl_delays": delays,
+            "sitemaps": sitemaps,
         }
 
     def can_fetch(self, url: str, user_agent: str | None = None) -> bool:

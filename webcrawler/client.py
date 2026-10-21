@@ -69,6 +69,8 @@ class AsyncCrawler:
                  retry_strategy: RetryStrategy | None = None,
                  circuit_breaker: CircuitBreaker | None = None,
                  timeout_growth: float = 0.5,
+                 parse_mode: str = "thread", parse_workers: int | None = None,
+                 keep_results: bool = True,
                  storage: DataStorage | None = None, storage_retries: int = 2,
                  storage_retry_delay: float = 0.05,
                  progress_interval: float = 1.0,
@@ -83,6 +85,7 @@ class AsyncCrawler:
         self.retry_strategy = retry_strategy
         self.circuit_breaker = circuit_breaker
         self.timeout_growth = timeout_growth
+        self.keep_results = keep_results
         self.storage = storage
         self.storage_retries = storage_retries
         self.storage_retry_delay = storage_retry_delay
@@ -90,7 +93,7 @@ class AsyncCrawler:
         self.storage_errors: list[dict] = []
         self.progress_interval = progress_interval
         self.on_progress = on_progress
-        self.parser = HTMLParser()
+        self.parser = HTMLParser(parse_mode=parse_mode, workers=parse_workers)
         self.limits = SemaphoreManager(max_concurrent, max_per_domain)
         self.rate_limiter: RateLimiter | None = None
         if requests_per_second or min_delay or jitter or respect_robots:
@@ -187,6 +190,10 @@ class AsyncCrawler:
         result = await self._request(url, self.user_agent, raise_for_status=False)
         return result.status, result.text
 
+    async def fetch_raw(self, url: str) -> tuple[int, str]:
+        """Публичная загрузка без исключений на 4xx и 5xx: (статус, текст)."""
+        return await self._raw_get(url)
+
     async def _check_robots(self, url: str, user_agent: str) -> None:
         await self.robots.fetch_robots(url)
         delay = self.robots.get_crawl_delay(user_agent, origin=origin_of(url))
@@ -272,6 +279,17 @@ class AsyncCrawler:
             else:
                 self.storage_saved += 1
                 return
+
+    @staticmethod
+    def _brief(parsed: dict) -> dict:
+        """Краткая сводка вместо полной страницы (keep_results=False): память не растёт."""
+        return {
+            "url": parsed["url"], "title": parsed.get("title", ""),
+            "status_code": parsed.get("status_code"),
+            "content_type": parsed.get("content_type", ""),
+            "links_count": len(parsed.get("links", [])),
+            "text_length": len(parsed.get("text", "")),
+        }
 
     def get_storage_stats(self) -> dict:
         stats = self.storage.stats() if self.storage else {}
@@ -380,7 +398,7 @@ class AsyncCrawler:
             except Exception as error:
                 queue.mark_failed(url, self._record_error(url, error))
                 continue
-            self.processed_urls[url] = parsed
+            self.processed_urls[url] = parsed if self.keep_results else self._brief(parsed)
             await self._store(url, parsed)
             depth = queue.depth(url)
             if depth < self.max_depth:
@@ -425,6 +443,7 @@ class AsyncCrawler:
         return stats
 
     async def close(self) -> None:
+        self.parser.close()
         if self.storage is not None:
             try:
                 await self.storage.close()

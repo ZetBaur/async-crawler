@@ -1,0 +1,63 @@
+# Пример конфигурации краулера. Запуск: python crawler.py --config config.example.yaml
+# Все настройки необязательны; здесь показаны значения по умолчанию, кроме start_urls.
+
+start_urls:
+  - https://books.toscrape.com/    # учебный сайт, на котором разрешён обход
+
+sitemap_urls: []                    # адреса sitemap.xml как дополнительный источник страниц
+sitemap_from_robots: false          # взять адреса sitemap из строк "Sitemap:" в robots.txt
+
+max_pages: 100                      # максимум страниц за запуск
+max_depth: 3                        # глубина обхода от стартовых адресов (0 = только они)
+max_concurrent: 10                  # одновременных запросов всего
+max_per_domain: null                # одновременных запросов на один домен (null = как max_concurrent)
+same_domain_only: true              # ходить только по ссылкам того же домена
+include_patterns: []                # обходить только адреса, подходящие под регулярку
+exclude_patterns: []                # не обходить адреса, подходящие под регулярку
+
+requests_per_second: 2.0            # не чаще N запросов в секунду на домен (null = без лимита)
+min_delay: 0.0                      # минимальная пауза между запросами, сек
+jitter: 0.1                         # случайная добавка к паузе, сек
+respect_robots: true                # соблюдать robots.txt и Crawl-delay
+user_agent: "AdvancedCrawler/1.0"
+user_agents: []                     # список User-Agent для ротации (пусто = только user_agent)
+
+connect_timeout: 5.0
+read_timeout: 15.0
+total_timeout: 60.0
+
+progress: true                      # показывать полосу прогресса
+parse_mode: thread                  # thread, inline или process (разбор HTML в процессах для тяжёлых страниц)
+parse_workers: null                 # число процессов для parse_mode: process (null = по числу ядер)
+keep_results: true                  # false: не держать страницы в памяти (нужен storage), для больших обходов
+
+retry:
+  enabled: true
+  max_retries: 3
+  backoff_factor: 2.0
+  base_delay: 0.5
+  max_delay: 30.0
+
+circuit_breaker:
+  enabled: false
+  failure_threshold: 5
+  window: 30.0
+  recovery_time: 10.0
+
+storage:
+  type: jsonl                       # none, json, jsonl, csv или sqlite
+  path: output/results.jsonl
+  buffer_size: 20                   # для json, jsonl, csv
+  batch_size: 20                    # для sqlite
+
+logging:
+  level: INFO                       # DEBUG, INFO, WARNING, ERROR
+  file: output/crawler.log          # null = только консоль
+  max_bytes: 1000000                # размер файла до ротации
+  backup_count: 3                   # сколько старых файлов хранить
+  json: false                       # true = одна строка JSON на сообщение
+
+output:
+  stats_json: output/stats.json
+  html_report: output/report.html
+  error_report: null

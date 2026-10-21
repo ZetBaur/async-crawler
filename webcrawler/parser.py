@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import re
+from concurrent.futures import ProcessPoolExecutor
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup, NavigableString
@@ -45,15 +46,55 @@ def make_soup(html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
 
 
-class HTMLParser:
-    """Достаёт из HTML ссылки, текст, метаданные, картинки, заголовки, таблицы, списки."""
+PARSE_MODES = ("thread", "inline", "process")
 
-    def __init__(self, same_domain_only: bool = False) -> None:
+
+def _parse_in_worker(same_domain_only: bool, html: str, url: str) -> dict:
+    """Разбор в дочернем процессе (функция на уровне модуля, чтобы её можно было передать)."""
+    return HTMLParser(same_domain_only, "inline")._parse(html, url)
+
+
+class HTMLParser:
+    """Достаёт из HTML ссылки, текст, метаданные, картинки, заголовки, таблицы, списки.
+
+    parse_mode:
+      "thread"  — разбор в потоке (по умолчанию): event loop не блокируется, но из-за GIL
+                  потоки не ускоряют сам разбор;
+      "inline"  — прямо в event loop: чуть быстрее на крошечных страницах, но на больших
+                  loop встаёт на время разбора;
+      "process" — в отдельных процессах: настоящая параллельность для тяжёлого разбора
+                  (стоит дороже при старте, окупается на больших страницах).
+    """
+
+    def __init__(self, same_domain_only: bool = False, parse_mode: str = "thread",
+                 workers: int | None = None) -> None:
+        if parse_mode not in PARSE_MODES:
+            raise ValueError(f"parse_mode должен быть одним из {PARSE_MODES}")
         self.same_domain_only = same_domain_only
+        self.parse_mode = parse_mode
+        self.workers = workers
+        self._pool: ProcessPoolExecutor | None = None
 
     async def parse_html(self, html: str, url: str) -> dict:
-        """Разбор страницы. Тяжёлую работу уводим в поток, чтобы не вешать event loop."""
+        """Разбор страницы в выбранном режиме (см. parse_mode)."""
+        if self.parse_mode == "inline":
+            return self._parse(html, url)
+        if self.parse_mode == "process":
+            try:
+                if self._pool is None:
+                    self._pool = ProcessPoolExecutor(max_workers=self.workers)
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    self._pool, _parse_in_worker, self.same_domain_only, html, url)
+            except Exception as error:
+                logger.warning("разбор в процессе не удался (%s: %s), разбираю в потоке",
+                               type(error).__name__, error)
         return await asyncio.to_thread(self._parse, html, url)
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
 
     def _parse(self, html: str, url: str) -> dict:
         errors: list[str] = []

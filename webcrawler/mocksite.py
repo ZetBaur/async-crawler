@@ -107,6 +107,7 @@ class MockSite:
         app.router.add_get("/broken", self._broken)
         app.router.add_get("/plain", self._plain)
         app.router.add_get("/binary", self._binary)
+        app.router.add_get("/big/{n:\\d+}", self._big)
         app.router.add_get("/bulk/{n:\\d+}", self._bulk)
         app.router.add_get("/robots.txt", self._robots)
         app.router.add_get("/sitemap.xml", self._sitemap)
@@ -164,6 +165,15 @@ class MockSite:
         return web.Response(body=b"\x89PNG\r\n\x1a\n" + bytes(range(256)),
                             content_type="image/png")
 
+    async def _big(self, request):
+        """Большая страница (около 100 КБ) для проверки расхода памяти."""
+        n = int(request.match_info["n"])
+        paragraphs = "".join(f"<p>Абзац {i} страницы {n}: " + "слово " * 30 + "</p>"
+                             for i in range(400))
+        return web.Response(
+            text=f"<html><head><title>Big {n}</title></head><body><h1>Big {n}</h1>"
+                 f"{paragraphs}</body></html>", content_type="text/html")
+
     async def _bulk(self, request):
         n = int(request.match_info["n"])
         delay = float(request.query.get("delay", "0.01"))
@@ -174,7 +184,8 @@ class MockSite:
             content_type="text/html")
 
     async def _robots(self, request):
-        return web.Response(text=ROBOTS_TXT, content_type="text/plain")
+        text = ROBOTS_TXT + f"\nSitemap: {self.url}/sitemap_index.xml\n"
+        return web.Response(text=text, content_type="text/plain")
 
     def _urlset(self, urls: list[str]) -> str:
         items = "".join(f"<url><loc>{self.url}{u}</loc></url>" for u in urls)
@@ -217,3 +228,27 @@ class MockSite:
 
     async def __aexit__(self, *exc_info) -> None:
         await self.stop()
+
+
+async def _serve(latency: float, port: int) -> None:
+    """Запуск сайта как отдельного процесса: python -m webcrawler.mocksite"""
+    site = MockSite(latency=latency)
+    runner = web.AppRunner(site._build_app(), access_log=None)
+    await runner.setup()
+    tcp = web.TCPSite(runner, site.host, port)
+    await tcp.start()
+    print(f"PORT={runner.addresses[0][1]}", flush=True)
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Локальный тестовый сайт для краулера")
+    parser.add_argument("--latency", type=float, default=0.0)
+    parser.add_argument("--port", type=int, default=0)
+    args = parser.parse_args()
+    try:
+        asyncio.run(_serve(args.latency, args.port))
+    except KeyboardInterrupt:
+        pass
