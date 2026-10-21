@@ -5,8 +5,9 @@ import json
 import logging
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -23,12 +24,30 @@ from webcrawler.limits import RateLimiter, SemaphoreManager
 from webcrawler.parser import HTMLParser, normalize_url
 from webcrawler.retry import CircuitBreaker, RetryStrategy
 from webcrawler.robots import RobotsParser, origin_of
+from webcrawler.storage import DataStorage, make_record
 
 logger = logging.getLogger("webcrawler")
 
 
 def domain_of(url: str) -> str:
     return urlparse(url).netloc.lower()
+
+
+class FetchResult(NamedTuple):
+    status: int
+    text: str
+    content_type: str
+
+
+TEXTUAL_TYPES = {"application/xhtml+xml", "application/xml", "application/json",
+                 "application/javascript", "image/svg+xml"}
+
+
+def is_textual(content_type: str) -> bool:
+    """Картинки, PDF и прочее двоичное не читаем как текст."""
+    return (not content_type or content_type.startswith("text/")
+            or content_type in TEXTUAL_TYPES
+            or content_type.endswith(("+xml", "+json")))
 
 
 class AsyncCrawler:
@@ -50,6 +69,8 @@ class AsyncCrawler:
                  retry_strategy: RetryStrategy | None = None,
                  circuit_breaker: CircuitBreaker | None = None,
                  timeout_growth: float = 0.5,
+                 storage: DataStorage | None = None, storage_retries: int = 2,
+                 storage_retry_delay: float = 0.05,
                  progress_interval: float = 1.0,
                  on_progress: Callable[[dict], None] | None = None) -> None:
         self.max_concurrent = max_concurrent
@@ -62,6 +83,11 @@ class AsyncCrawler:
         self.retry_strategy = retry_strategy
         self.circuit_breaker = circuit_breaker
         self.timeout_growth = timeout_growth
+        self.storage = storage
+        self.storage_retries = storage_retries
+        self.storage_retry_delay = storage_retry_delay
+        self.storage_saved = 0
+        self.storage_errors: list[dict] = []
         self.progress_interval = progress_interval
         self.on_progress = on_progress
         self.parser = HTMLParser()
@@ -119,7 +145,7 @@ class AsyncCrawler:
             self.rate_limiter.report_error(domain)
 
     async def _request(self, url: str, user_agent: str, raise_for_status: bool = True,
-                       attempt: int = 0) -> tuple[int, str]:
+                       attempt: int = 0) -> FetchResult:
         session = await self._get_session()
         domain = domain_of(url)
         if self.rate_limiter:
@@ -132,7 +158,9 @@ class AsyncCrawler:
                                        raise_for_status=raise_for_status,
                                        timeout=self._timeout_for(attempt)) as response:
                     status = response.status
-                    text = await response.text(errors="replace")
+                    content_type = response.content_type or ""
+                    text = (await response.text(errors="replace")
+                            if is_textual(content_type) else "")
             except aiohttp.ClientResponseError as error:
                 self._note_failure(domain, error.status)
                 logger.warning("error url=%s type=ClientResponseError status=%s",
@@ -152,11 +180,12 @@ class AsyncCrawler:
                 self.rate_limiter.report_success(domain)
             logger.info("done url=%s status=%s time=%.2fs",
                         url, status, time.perf_counter() - started)
-            return status, text
+            return FetchResult(status, text, content_type)
 
     async def _raw_get(self, url: str) -> tuple[int, str]:
         """Загрузка без исключений на 4xx и 5xx (для robots.txt и sitemap)."""
-        return await self._request(url, self.user_agent, raise_for_status=False)
+        result = await self._request(url, self.user_agent, raise_for_status=False)
+        return result.status, result.text
 
     async def _check_robots(self, url: str, user_agent: str) -> None:
         await self.robots.fetch_robots(url)
@@ -168,13 +197,13 @@ class AsyncCrawler:
             logger.warning("blocked by robots.txt url=%s", url)
             raise RobotsBlockedError("запрещено robots.txt", url)
 
-    async def _attempt(self, url: str, user_agent: str, attempt: int = 0) -> str:
+    async def _attempt(self, url: str, user_agent: str, attempt: int = 0) -> FetchResult:
         """Одна попытка загрузки с учётом circuit breaker."""
         domain = domain_of(url)
         if self.circuit_breaker:
             self.circuit_breaker.check(domain)
         try:
-            _, text = await self._request(url, user_agent, True, attempt=attempt)
+            result = await self._request(url, user_agent, True, attempt=attempt)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -184,10 +213,14 @@ class AsyncCrawler:
             raise
         if self.circuit_breaker:
             self.circuit_breaker.record_success(domain)
-        return text
+        return result
 
     async def fetch_url(self, url: str) -> str:
-        """Загружает страницу.
+        """Загружает страницу и возвращает её текст."""
+        return (await self.fetch_page(url)).text
+
+    async def fetch_page(self, url: str) -> FetchResult:
+        """Загружает страницу: статус, текст и тип содержимого.
 
         Без retry_strategy ошибки aiohttp пробрасываются как есть (Day 1). С ней
         временные ошибки повторяются, а итоговая ошибка приходит нашим типом
@@ -214,6 +247,36 @@ class AsyncCrawler:
             else:
                 pages[url] = result
         return pages
+
+    # ---------- Day 6: сохранение ----------
+
+    async def _store(self, url: str, parsed: dict) -> None:
+        """Сохраняет страницу в хранилище. Ошибки записи не останавливают краулер."""
+        if self.storage is None:
+            return
+        record = make_record(parsed)
+        for attempt in range(self.storage_retries + 1):
+            try:
+                await self.storage.save(record)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("storage error url=%s attempt=%s/%s: %s: %s", url,
+                               attempt + 1, self.storage_retries + 1,
+                               type(error).__name__, error)
+                if attempt < self.storage_retries:
+                    await asyncio.sleep(self.storage_retry_delay * (2 ** attempt))
+                    continue
+                self.storage_errors.append(
+                    {"url": url, "type": type(error).__name__, "message": str(error)})
+            else:
+                self.storage_saved += 1
+                return
+
+    def get_storage_stats(self) -> dict:
+        stats = self.storage.stats() if self.storage else {}
+        return {**stats, "crawler_saved": self.storage_saved,
+                "errors": len(self.storage_errors)}
 
     # ---------- Day 5: учёт ошибок ----------
 
@@ -249,8 +312,11 @@ class AsyncCrawler:
     # ---------- Day 2: разбор ----------
 
     async def fetch_and_parse(self, url: str) -> dict:
-        html = await self.fetch_url(url)
-        parsed = await self.parser.parse_html(html, url)
+        page = await self.fetch_page(url)
+        parsed = await self.parser.parse_html(page.text, url)
+        parsed["status_code"] = page.status
+        parsed["content_type"] = page.content_type
+        parsed["crawled_at"] = datetime.now(timezone.utc)
         if parsed["errors"]:
             logger.warning("parse url=%s частичный результат: %s", url, parsed["errors"])
         return parsed
@@ -266,6 +332,8 @@ class AsyncCrawler:
         self.failed_urls = {}
         self.processed_urls = {}
         self.robots_blocked = []
+        self.storage_saved = 0
+        self.storage_errors = []
         self.error_counts = Counter()
         self.error_log = []
         queue = self.queue = CrawlerQueue(max_urls=max_pages)
@@ -289,6 +357,12 @@ class AsyncCrawler:
             for task in (*workers, reporter):
                 task.cancel()
             await asyncio.gather(*workers, reporter, return_exceptions=True)
+        if self.storage:
+            try:
+                await self.storage.flush()
+            except Exception as error:
+                logger.error("не удалось сбросить хранилище: %s: %s",
+                             type(error).__name__, error)
         self._emit_progress()
         return dict(self.processed_urls)
 
@@ -307,6 +381,7 @@ class AsyncCrawler:
                 queue.mark_failed(url, self._record_error(url, error))
                 continue
             self.processed_urls[url] = parsed
+            await self._store(url, parsed)
             depth = queue.depth(url)
             if depth < self.max_depth:
                 for link in parsed["links"]:
@@ -350,6 +425,12 @@ class AsyncCrawler:
         return stats
 
     async def close(self) -> None:
+        if self.storage is not None:
+            try:
+                await self.storage.close()
+            except Exception as error:
+                logger.error("не удалось закрыть хранилище: %s: %s",
+                             type(error).__name__, error)
         if self._session is not None and not self._session.closed:
             await self._session.close()
 

@@ -106,6 +106,7 @@ class MockSite:
         app.router.add_get("/flaky/{key}", self._flaky)
         app.router.add_get("/broken", self._broken)
         app.router.add_get("/plain", self._plain)
+        app.router.add_get("/binary", self._binary)
         app.router.add_get("/bulk/{n:\\d+}", self._bulk)
         app.router.add_get("/robots.txt", self._robots)
         app.router.add_get("/sitemap.xml", self._sitemap)
@@ -158,6 +159,10 @@ class MockSite:
 
     async def _plain(self, request):
         return web.Response(text="просто текст", content_type="text/plain")
+
+    async def _binary(self, request):
+        return web.Response(body=b"\x89PNG\r\n\x1a\n" + bytes(range(256)),
+                            content_type="image/png")
 
     async def _bulk(self, request):
         n = int(request.match_info["n"])
