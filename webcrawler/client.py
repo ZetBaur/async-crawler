@@ -280,6 +280,29 @@ class AsyncCrawler:
                 self.storage_saved += 1
                 return
 
+    async def _flush_storage(self) -> None:
+        """Финальный сброс буфера с повторами. Окончательная ошибка попадает в storage_errors."""
+        if self.storage is None:
+            return
+        for attempt in range(self.storage_retries + 1):
+            try:
+                await self.storage.flush()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("storage flush attempt=%s/%s: %s: %s", attempt + 1,
+                               self.storage_retries + 1, type(error).__name__, error)
+                if attempt < self.storage_retries:
+                    await asyncio.sleep(self.storage_retry_delay * (2 ** attempt))
+                    continue
+                lost = self.storage.pending()
+                self.storage_saved = max(0, self.storage_saved - lost)
+                self.storage_errors.append(
+                    {"url": None, "type": type(error).__name__, "message": str(error),
+                     "lost_records": lost})
+                logger.error("не удалось сбросить хранилище, не записано записей: %s", lost)
+
     @staticmethod
     def _brief(parsed: dict) -> dict:
         """Краткая сводка вместо полной страницы (keep_results=False): память не растёт."""
@@ -375,12 +398,7 @@ class AsyncCrawler:
             for task in (*workers, reporter):
                 task.cancel()
             await asyncio.gather(*workers, reporter, return_exceptions=True)
-        if self.storage:
-            try:
-                await self.storage.flush()
-            except Exception as error:
-                logger.error("не удалось сбросить хранилище: %s: %s",
-                             type(error).__name__, error)
+        await self._flush_storage()
         self._emit_progress()
         return dict(self.processed_urls)
 
