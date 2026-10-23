@@ -56,6 +56,10 @@ class DataStorage(ABC):
     async def close(self) -> None:
         """Сбрасывает буфер и закрывает файл или соединение."""
 
+    def pending(self) -> int:
+        """Сколько принятых записей ещё не записано на диск."""
+        return 0
+
     def stats(self) -> dict:
         return {}
 
@@ -100,9 +104,43 @@ class _BufferedFileStorage(DataStorage):
             return
         file = await self._open()
         chunk = "".join(self._buffer)
+        position = await file.tell()
+        try:
+            await file.write(chunk)
+            await file.flush()
+        except Exception:
+            await self._rollback(file, position)
+            raise
+        self.saved += len(self._buffer)
         self._buffer = []
-        await file.write(chunk)
-        await file.flush()
+
+    @staticmethod
+    async def _rollback(file, position: int) -> None:
+        """Убирает с диска частично записанную пачку, чтобы повтор не дал дубликатов."""
+        try:
+            await file.seek(position)
+            await file.truncate(position)
+        except Exception as error:
+            logger.warning("не удалось откатить частичную запись: %s: %s",
+                           type(error).__name__, error)
+
+    async def _enqueue(self, item: str, undo=None) -> None:
+        """Добавляет запись в буфер; при сбое записи пачки убирает только её саму.
+
+        Ранее принятые записи остаются в буфере, их повторит следующий сброс.
+        """
+        self._buffer.append(item)
+        if len(self._buffer) >= self.buffer_size:
+            try:
+                await self._write_buffer()
+            except Exception:
+                self._buffer.pop()
+                if undo is not None:
+                    undo()
+                raise
+
+    def pending(self) -> int:
+        return len(self._buffer)
 
     async def flush(self) -> None:
         async with self._lock:
@@ -163,13 +201,12 @@ class JSONStorage(_BufferedFileStorage):
                           indent=self.indent if self.mode == "array" else None)
         async with self._lock:
             if self.mode == "lines":
-                self._buffer.append(text + "\n")
+                await self._enqueue(text + "\n")
             else:
-                self._buffer.append(("" if self._first else ",") + "\n" + text)
+                was_first = self._first
                 self._first = False
-            self.saved += 1
-            if len(self._buffer) >= self.buffer_size:
-                await self._write_buffer()
+                await self._enqueue(("" if was_first else ",") + "\n" + text,
+                                    undo=lambda: setattr(self, "_first", was_first))
 
     async def _on_close(self) -> None:
         if self.mode == "array":
@@ -225,15 +262,15 @@ class CSVStorage(_BufferedFileStorage):
                                sorted(extra))
                 self._warned_extra = True
             rows = []
-            if not self._header_written:
+            header_was_written = self._header_written
+            if not header_was_written:
                 rows.append(self.fieldnames)
                 self._header_written = True
             rows.append([flatten_value(data.get(name), self.sanitize_formulas)
                          for name in self.fieldnames])
-            self._buffer.append(self._encode(rows))
-            self.saved += 1
-            if len(self._buffer) >= self.buffer_size:
-                await self._write_buffer()
+            await self._enqueue(self._encode(rows),
+                                undo=lambda: setattr(self, "_header_written",
+                                                     header_was_written))
 
 
 class SQLiteStorage(DataStorage):
@@ -283,7 +320,11 @@ class SQLiteStorage(DataStorage):
             await self.init_db()
             self._batch.append(row)
             if len(self._batch) >= self.batch_size:
-                await self._write_batch()
+                try:
+                    await self._write_batch()
+                except Exception:
+                    self._batch.pop()
+                    raise
 
     async def _write_batch(self) -> None:
         if not self._batch:
@@ -299,6 +340,9 @@ class SQLiteStorage(DataStorage):
             self._batch = rows + self._batch
             raise
         self.saved += len(rows)
+
+    def pending(self) -> int:
+        return len(self._batch)
 
     async def flush(self) -> None:
         async with self._lock:
@@ -376,6 +420,9 @@ class MultiStorage(DataStorage):
                                method, type(result).__name__, result)
         if errors and len(errors) == len(self.storages):
             raise errors[0]
+
+    def pending(self) -> int:
+        return min(storage.pending() for storage in self.storages)
 
     async def save(self, data: dict) -> None:
         await self._run("save", data)
